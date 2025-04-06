@@ -46,6 +46,7 @@ const TEMP_CHAR_UUID = '00002a6e-0000-1000-8000-00805f9b34fb';
 
 let txChar;
 let device;
+let isConnected = false;
 
 function startUpdateLightListener() {
     onValue(updateLightRef, async (snapshot) => {
@@ -86,8 +87,8 @@ function startIntervalListener() {
             updateIntervalValue = 10000;
         }
         console.log('Interval changed to: ', intervalInSeconds, 's');
-        if (txChar) {
-            const message = `interval:${updateIntervalValue}`;
+        if (txChar && isConnected) {
+            const message = `interval:${intervalInSeconds}`;
             try {
                 await txChar.writeValue(Buffer.from(message));
                 console.log('Sent over BLE:', message);
@@ -95,7 +96,7 @@ function startIntervalListener() {
                 console.error('Error writing to TX characteristic:', error);
             }
         } else {
-            console.warn('txChar is not defined. Cannot send interval message.');
+            console.warn('txChar is not defined or not connected. Cannot send interval message.');
         }
         interval = updateIntervalValue;
         startSensorUpdates(interval);
@@ -135,102 +136,127 @@ async function startApp() {
         const userCredential = await signInAnonymously(auth);
         console.log('User signed in:', userCredential.user.uid);
         startUpdateLightListener();
-        startSensorUpdates(interval); // Start with default interval
+        startSensorUpdates(interval);
     } catch (error) {
         console.error('Error signing in:', error);
     }
 }
 
+async function connectToDevice(adapter, destroy) {
+    while (true) { // Infinite loop for reconnection
+        try {
+            if (!isConnected) {
+                console.log('discovering...');
+                device = await adapter.waitDevice(ARDUINO_BLUETOOTH_ADDR.toUpperCase());
+                console.log('found device. attempting connection...');
+                await device.connect();
+                console.log('connected to device!');
+                isConnected = true;
+
+                const gattServer = await device.gatt();
+                const uartService = await gattServer.getPrimaryService(UART_SERVICE_UUID.toLowerCase());
+                txChar = await uartService.getCharacteristic(TX_CHARACTERISTIC_UUID.toLowerCase());
+                const rxChar = await uartService.getCharacteristic(RX_CHARACTERISTIC_UUID.toLowerCase());
+                const eesService = await gattServer.getPrimaryService(EES_SERVICE_UUID.toLowerCase());
+                const tempChar = await eesService.getCharacteristic(TEMP_CHAR_UUID.toLowerCase());
+
+                // Fetch and send initial Interval
+                try {
+                    const intervalSnapshot = await get(intervalRef);
+                    let initialInterval = intervalSnapshot.val();
+                    initialInterval = parseFloat(initialInterval) || 1;
+                    if (initialInterval < 1) initialInterval = 1;
+                    if (initialInterval > 10) initialInterval = 10;
+                    const msInterval = initialInterval * 1000;
+                    const message = `interval:${initialInterval}`; // Send in seconds
+                    await txChar.writeValue(Buffer.from(message));
+                    console.log('Initial interval sent over BLE:', message);
+                    interval = msInterval;
+                    startSensorUpdates(interval);
+                } catch (error) {
+                    console.error('Error fetching initial Interval:', error);
+                    const message = `interval:1`;
+                    await txChar.writeValue(Buffer.from(message));
+                    console.log('Sent fallback interval over BLE:', message);
+                    interval = 1000;
+                    startSensorUpdates(interval);
+                }
+
+                await rxChar.startNotifications();
+                rxChar.on('valuechanged', buffer => {
+                    console.log('Received: ' + buffer.toString());
+                });
+
+                await tempChar.startNotifications();
+                tempChar.on('valuechanged', async buffer => {
+                    if (buffer.length !== 2) {
+                        console.error('Temperature data buffer is not 2 bytes long', buffer.length);
+                        return;
+                    }
+                    const tempRaw = (buffer[1] << 8) | buffer[0];
+                    const tempC = tempRaw / 100.0;
+                    console.log('Temperature: ' + tempC.toFixed(2) + ' °C');
+                    try {
+                        await update(stateRef, { temperature: tempC });
+                    } catch (error) {
+                        console.error('Error updating temperature to Firebase:', error);
+                    }
+                });
+
+                // Handle disconnection
+                device.on('disconnect', async () => {
+                    console.log('Device disconnected');
+                    isConnected = false;
+                    txChar = null; // Clear characteristic to avoid stale references
+                });
+            }
+        } catch (error) {
+            console.error('Connection error:', error);
+            isConnected = false;
+            if (device) await device.disconnect().catch(() => {}); // Clean up if possible
+        }
+
+        // Wait before retrying if not connected
+        if (!isConnected) {
+            console.log('Retrying connection in 5 seconds...');
+            await new Promise(resolve => setTimeout(resolve, 5000));
+        }
+    }
+}
+
 async function main() {
-    await startApp(); // Wait for Firebase auth
+    await startApp();
 
     const { bluetooth, destroy } = createBluetooth();
     const adapter = await bluetooth.defaultAdapter();
-    const discovery = await adapter.startDiscovery();
-    console.log('discovering...');
+    await adapter.startDiscovery();
 
-    device = await adapter.waitDevice(ARDUINO_BLUETOOTH_ADDR.toUpperCase());
-    console.log('found device. attempting connection...');
-    await device.connect();
-    console.log('connected to device!');
+    // Start connection loop
+    connectToDevice(adapter, destroy);
 
-    const gattServer = await device.gatt();
-    try {
-        const uartService = await gattServer.getPrimaryService(UART_SERVICE_UUID.toLowerCase());
-        txChar = await uartService.getCharacteristic(TX_CHARACTERISTIC_UUID.toLowerCase());
-        const rxChar = await uartService.getCharacteristic(RX_CHARACTERISTIC_UUID.toLowerCase());
-        const eesService = await gattServer.getPrimaryService(EES_SERVICE_UUID.toLowerCase());
-        const tempChar = await eesService.getCharacteristic(TEMP_CHAR_UUID.toLowerCase());
-
-        // Fetch initial Interval from Firebase and send to Arduino
-        try {
-            const intervalSnapshot = await get(intervalRef);
-            let initialInterval = intervalSnapshot.val();
-            initialInterval = parseFloat(initialInterval) || 1; // Default to 1 if null/invalid
-            if (initialInterval < 1) initialInterval = 1;
-            if (initialInterval > 10) initialInterval = 10;
-            const msInterval = initialInterval * 1000;
-            const message = `interval:${msInterval}`;
-            await txChar.writeValue(Buffer.from(message));
-            console.log('Initial interval sent over BLE:', message);
-            interval = msInterval; // Update local interval
-            startSensorUpdates(interval); // Restart with initial interval
-        } catch (error) {
-            console.error('Error fetching initial Interval from Firebase:', error);
-            const message = `interval:1`; // Fallback to 1 second
-            await txChar.writeValue(Buffer.from(message));
-            console.log('Sent fallback interval over BLE:', message);
-            interval = 1000;
-            startSensorUpdates(interval);
-        }
-
-        await rxChar.startNotifications();
-        rxChar.on('valuechanged', buffer => {
-            console.log('Received: ' + buffer.toString());
-        });
-
-        await tempChar.startNotifications();
-        tempChar.on('valuechanged', async buffer => {
-            if (buffer.length !== 2) {
-                console.error('Temperature data buffer is not 2 bytes long', buffer.length);
-                return;
-            }
-            const tempRaw = (buffer[1] << 8) | buffer[0];
-            const tempC = tempRaw / 100.0;
-            console.log('Temperature: ' + tempC.toFixed(2) + ' °C');
-            try {
-                await update(stateRef, { temperature: tempC });
-            } catch (error) {
-                console.error('Error updating temperature to Firebase:', error);
-            }
-        });
-    } catch (error) {
-        console.error('Error getting service or characteristic:', error);
-        await device.disconnect();
-        destroy();
-        process.exit(1);
-    }
-
-    // Start interval listener after initial setup
-    startIntervalListener();
-
+    // Handle manual exit
     const stdin = process.openStdin();
     stdin.addListener('data', async function(d) {
         let inStr = d.toString().trim();
         if (inStr === 'exit') {
             console.log('disconnecting...');
-            await device.disconnect();
+            if (device && isConnected) await device.disconnect();
             console.log('disconnected.');
             destroy();
             process.exit();
         }
         inStr = (inStr.length > 20) ? inStr.slice(0, 20) : inStr;
-        await txChar.writeValue(Buffer.from(inStr)).then(() => {
-            console.log('Sent: ' + inStr);
-        }).catch(err => {
-            console.error('Error writing to TX characteristic:', err);
-        });
+        if (txChar && isConnected) {
+            await txChar.writeValue(Buffer.from(inStr)).then(() => {
+                console.log('Sent: ' + inStr);
+            }).catch(err => {
+                console.error('Error writing to TX characteristic:', err);
+            });
+        }
     });
+
+    // Start interval listener after initial setup
+    startIntervalListener();
 }
 
 main().then((ret) => {
