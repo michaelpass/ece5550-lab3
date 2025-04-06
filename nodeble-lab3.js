@@ -5,6 +5,8 @@
 //         Lab 03                                 |
 // ==================================================
 
+
+
 require('dotenv').config();
 var nodeimu = require('@trbll/nodeimu');
 var IMU = new nodeimu.IMU();
@@ -12,6 +14,10 @@ var sense = require('@trbll/sense-hat-led');
 const { getDatabase, ref, onValue, set, update, get } = require('firebase/database');
 const { getAuth, signInAnonymously } = require('firebase/auth');
 const { initializeApp } = require('firebase/app');
+
+// At the top of the file
+process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
+process.on('uncaughtException', (error) => console.error('Uncaught Exception:', error));
 
 var interval = 1000; // Default interval
 var currentIntervalID = null;
@@ -80,12 +86,8 @@ function startIntervalListener() {
         updateIntervalValue = parseFloat(updateIntervalValue);
         const intervalInSeconds = updateIntervalValue;
         updateIntervalValue = 1000 * updateIntervalValue;
-        if (updateIntervalValue < 1000) {
-            updateIntervalValue = 1000;
-        }
-        if (updateIntervalValue > 10000) {
-            updateIntervalValue = 10000;
-        }
+        if (updateIntervalValue < 1000) updateIntervalValue = 1000;
+        if (updateIntervalValue > 10000) updateIntervalValue = 10000;
         console.log('Interval changed to: ', intervalInSeconds, 's');
         if (txChar && isConnected) {
             const message = `interval:${intervalInSeconds}`;
@@ -112,11 +114,8 @@ async function updateSensorReadings() {
             throw new Error('IMU data is not an object or is undefined');
         }
         const humidity = Number(data.humidity || 0).toFixed(2);
-        console.log('Humidity: ' + humidity + ' %');
-        const updates = {
-            humidity: parseFloat(humidity)
-        };
-        await update(stateRef, updates);
+        console.log('Humidity measured: ' + humidity + ' %');
+        await update(stateRef, { humidity: parseFloat(humidity) });
     } catch (error) {
         console.error('Error getting IMU data:', error);
     }
@@ -142,8 +141,31 @@ async function startApp() {
     }
 }
 
+async function sendInitialInterval() {
+    try {
+        const intervalSnapshot = await get(intervalRef);
+        let initialInterval = intervalSnapshot.val();
+        initialInterval = parseFloat(initialInterval) || 1;
+        if (initialInterval < 1) initialInterval = 1;
+        if (initialInterval > 10) initialInterval = 10;
+        const msInterval = initialInterval * 1000;
+        const message = `interval:${initialInterval}`;
+        await txChar.writeValue(Buffer.from(message));
+        console.log('Initial interval sent over BLE:', message);
+        interval = msInterval;
+        startSensorUpdates(interval);
+    } catch (error) {
+        console.error('Error fetching initial Interval:', error);
+        const message = `interval:1`;
+        await txChar.writeValue(Buffer.from(message));
+        console.log('Sent fallback interval over BLE:', message);
+        interval = 1000;
+        startSensorUpdates(interval);
+    }
+}
+
 async function connectToDevice(adapter, destroy) {
-    while (true) { // Infinite loop for reconnection
+    while (true) {
         try {
             if (!isConnected) {
                 console.log('discovering...');
@@ -154,69 +176,53 @@ async function connectToDevice(adapter, destroy) {
                 isConnected = true;
 
                 const gattServer = await device.gatt();
+                console.log('GATT server acquired');
                 const uartService = await gattServer.getPrimaryService(UART_SERVICE_UUID.toLowerCase());
                 txChar = await uartService.getCharacteristic(TX_CHARACTERISTIC_UUID.toLowerCase());
                 const rxChar = await uartService.getCharacteristic(RX_CHARACTERISTIC_UUID.toLowerCase());
                 const eesService = await gattServer.getPrimaryService(EES_SERVICE_UUID.toLowerCase());
                 const tempChar = await eesService.getCharacteristic(TEMP_CHAR_UUID.toLowerCase());
 
-                // Fetch and send initial Interval
-                try {
-                    const intervalSnapshot = await get(intervalRef);
-                    let initialInterval = intervalSnapshot.val();
-                    initialInterval = parseFloat(initialInterval) || 1;
-                    if (initialInterval < 1) initialInterval = 1;
-                    if (initialInterval > 10) initialInterval = 10;
-                    const msInterval = initialInterval * 1000;
-                    const message = `interval:${initialInterval}`; // Send in seconds
-                    await txChar.writeValue(Buffer.from(message));
-                    console.log('Initial interval sent over BLE:', message);
-                    interval = msInterval;
-                    startSensorUpdates(interval);
-                } catch (error) {
-                    console.error('Error fetching initial Interval:', error);
-                    const message = `interval:1`;
-                    await txChar.writeValue(Buffer.from(message));
-                    console.log('Sent fallback interval over BLE:', message);
-                    interval = 1000;
-                    startSensorUpdates(interval);
-                }
-
+                console.log('Starting RX notifications');
                 await rxChar.startNotifications();
                 rxChar.on('valuechanged', buffer => {
-                    console.log('Received: ' + buffer.toString());
+                    console.log('RX Received: ' + buffer.toString());
                 });
 
+                console.log('Starting temperature notifications');
                 await tempChar.startNotifications();
-                tempChar.on('valuechanged', async buffer => {
+                tempChar.on('valuechanged', buffer => {
+                    //console.log('Temperature event triggered');
                     if (buffer.length !== 2) {
                         console.error('Temperature data buffer is not 2 bytes long', buffer.length);
                         return;
                     }
                     const tempRaw = (buffer[1] << 8) | buffer[0];
                     const tempC = tempRaw / 100.0;
-                    console.log('Temperature: ' + tempC.toFixed(2) + ' °C');
-                    try {
-                        await update(stateRef, { temperature: tempC });
-                    } catch (error) {
-                        console.error('Error updating temperature to Firebase:', error);
-                    }
+                    console.log('Temperature received: ' + tempC.toFixed(2) + ' °C');
+                    update(stateRef, { temperature: tempC });
+                    //    .then(() => console.log('Firebase update successful'))
+                    //    .catch(error => console.error('Error updating temperature to Firebase:', error.message));
                 });
 
-                // Handle disconnection
+                console.log('Sending initial interval');
+                await sendInitialInterval();
+                console.log('Initial interval sent successfully');
+
                 device.on('disconnect', async () => {
                     console.log('Device disconnected');
                     isConnected = false;
-                    txChar = null; // Clear characteristic to avoid stale references
+                    txChar = null;
                 });
             }
+            // Allow event loop to process notifications
+            await new Promise(resolve => setTimeout(resolve, 100));
         } catch (error) {
-            console.error('Connection error:', error);
+            console.error('Connection error:', error.message);
             isConnected = false;
-            if (device) await device.disconnect().catch(() => {}); // Clean up if possible
+            if (device) await device.disconnect().catch(() => {});
         }
 
-        // Wait before retrying if not connected
         if (!isConnected) {
             console.log('Retrying connection in 5 seconds...');
             await new Promise(resolve => setTimeout(resolve, 5000));
@@ -230,11 +236,11 @@ async function main() {
     const { bluetooth, destroy } = createBluetooth();
     const adapter = await bluetooth.defaultAdapter();
     await adapter.startDiscovery();
+    console.log('Discovery started...');
 
-    // Start connection loop
-    connectToDevice(adapter, destroy);
+    await connectToDevice(adapter, destroy);
+    await adapter.stopDiscovery(); // Stop discovery after connecting
 
-    // Handle manual exit
     const stdin = process.openStdin();
     stdin.addListener('data', async function(d) {
         let inStr = d.toString().trim();
@@ -255,7 +261,6 @@ async function main() {
         }
     });
 
-    // Start interval listener after initial setup
     startIntervalListener();
 }
 
