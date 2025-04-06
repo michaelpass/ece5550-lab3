@@ -13,7 +13,7 @@ const { getDatabase, ref, onValue, set, update, get } = require('firebase/databa
 const { getAuth, signInAnonymously } = require('firebase/auth');
 const { initializeApp } = require('firebase/app');
 
-var interval = 1000;
+var interval = 1000; // Default interval
 var currentIntervalID = null;
 
 const firebaseConfig = {
@@ -82,12 +82,12 @@ function startIntervalListener() {
         if (updateIntervalValue < 1000) {
             updateIntervalValue = 1000;
         }
-        if (updateIntervalValue > 10000) { // Cap at 10 seconds
+        if (updateIntervalValue > 10000) {
             updateIntervalValue = 10000;
         }
         console.log('Interval changed to: ', intervalInSeconds, 's');
         if (txChar) {
-            const message = `interval:${intervalInSeconds}`;
+            const message = `interval:${updateIntervalValue}`;
             try {
                 await txChar.writeValue(Buffer.from(message));
                 console.log('Sent over BLE:', message);
@@ -135,15 +135,14 @@ async function startApp() {
         const userCredential = await signInAnonymously(auth);
         console.log('User signed in:', userCredential.user.uid);
         startUpdateLightListener();
-        // Move startIntervalListener to main after Bluetooth setup
-        startSensorUpdates(interval); // Use initial interval
+        startSensorUpdates(interval); // Start with default interval
     } catch (error) {
         console.error('Error signing in:', error);
     }
 }
 
 async function main() {
-    await startApp(); // Wait for Firebase auth before proceeding
+    await startApp(); // Wait for Firebase auth
 
     const { bluetooth, destroy } = createBluetooth();
     const adapter = await bluetooth.defaultAdapter();
@@ -163,21 +162,47 @@ async function main() {
         const eesService = await gattServer.getPrimaryService(EES_SERVICE_UUID.toLowerCase());
         const tempChar = await eesService.getCharacteristic(TEMP_CHAR_UUID.toLowerCase());
 
+        // Fetch initial Interval from Firebase and send to Arduino
+        try {
+            const intervalSnapshot = await get(intervalRef);
+            let initialInterval = intervalSnapshot.val();
+            initialInterval = parseFloat(initialInterval) || 1; // Default to 1 if null/invalid
+            if (initialInterval < 1) initialInterval = 1;
+            if (initialInterval > 10) initialInterval = 10;
+            const msInterval = initialInterval * 1000;
+            const message = `interval:${msInterval}`;
+            await txChar.writeValue(Buffer.from(message));
+            console.log('Initial interval sent over BLE:', message);
+            interval = msInterval; // Update local interval
+            startSensorUpdates(interval); // Restart with initial interval
+        } catch (error) {
+            console.error('Error fetching initial Interval from Firebase:', error);
+            const message = `interval:1`; // Fallback to 1 second
+            await txChar.writeValue(Buffer.from(message));
+            console.log('Sent fallback interval over BLE:', message);
+            interval = 1000;
+            startSensorUpdates(interval);
+        }
+
         await rxChar.startNotifications();
         rxChar.on('valuechanged', buffer => {
             console.log('Received: ' + buffer.toString());
         });
 
         await tempChar.startNotifications();
-        tempChar.on('valuechanged', buffer => {
+        tempChar.on('valuechanged', async buffer => {
             if (buffer.length !== 2) {
                 console.error('Temperature data buffer is not 2 bytes long', buffer.length);
                 return;
             }
             const tempRaw = (buffer[1] << 8) | buffer[0];
             const tempC = tempRaw / 100.0;
-            update(stateRef, { temperature: tempC });
             console.log('Temperature: ' + tempC.toFixed(2) + ' °C');
+            try {
+                await update(stateRef, { temperature: tempC });
+            } catch (error) {
+                console.error('Error updating temperature to Firebase:', error);
+            }
         });
     } catch (error) {
         console.error('Error getting service or characteristic:', error);
@@ -186,7 +211,7 @@ async function main() {
         process.exit(1);
     }
 
-    // Start interval listener after Bluetooth is set up
+    // Start interval listener after initial setup
     startIntervalListener();
 
     const stdin = process.openStdin();
