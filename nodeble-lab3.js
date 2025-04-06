@@ -5,8 +5,6 @@
 //         Lab 03                                 |
 // ==================================================
 
-
-
 require('dotenv').config();
 var nodeimu = require('@trbll/nodeimu');
 var IMU = new nodeimu.IMU();
@@ -15,7 +13,6 @@ const { getDatabase, ref, onValue, set, update, get } = require('firebase/databa
 const { getAuth, signInAnonymously } = require('firebase/auth');
 const { initializeApp } = require('firebase/app');
 
-// At the top of the file
 process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 process.on('uncaughtException', (error) => console.error('Uncaught Exception:', error));
 
@@ -88,9 +85,8 @@ function startIntervalListener() {
         updateIntervalValue = 1000 * updateIntervalValue;
         if (updateIntervalValue < 1000) updateIntervalValue = 1000;
         if (updateIntervalValue > 10000) updateIntervalValue = 10000;
-        console.log('Interval changed to: ', intervalInSeconds, 's');
         if (txChar && isConnected) {
-            const message = `interval:${intervalInSeconds}`;
+            const message = `interval:${updateIntervalValue}`;
             try {
                 await txChar.writeValue(Buffer.from(message));
                 console.log('Sent over BLE:', message);
@@ -135,6 +131,7 @@ async function startApp() {
         const userCredential = await signInAnonymously(auth);
         console.log('User signed in:', userCredential.user.uid);
         startUpdateLightListener();
+        startIntervalListener(); // Start listener here
         startSensorUpdates(interval);
     } catch (error) {
         console.error('Error signing in:', error);
@@ -149,7 +146,7 @@ async function sendInitialInterval() {
         if (initialInterval < 1) initialInterval = 1;
         if (initialInterval > 10) initialInterval = 10;
         const msInterval = initialInterval * 1000;
-        const message = `interval:${initialInterval}`;
+        const message = `interval:${msInterval}`;
         await txChar.writeValue(Buffer.from(message));
         console.log('Initial interval sent over BLE:', message);
         interval = msInterval;
@@ -192,7 +189,6 @@ async function connectToDevice(adapter, destroy) {
                 console.log('Starting temperature notifications');
                 await tempChar.startNotifications();
                 tempChar.on('valuechanged', buffer => {
-                    //console.log('Temperature event triggered');
                     if (buffer.length !== 2) {
                         console.error('Temperature data buffer is not 2 bytes long', buffer.length);
                         return;
@@ -201,8 +197,6 @@ async function connectToDevice(adapter, destroy) {
                     const tempC = tempRaw / 100.0;
                     console.log('Temperature received: ' + tempC.toFixed(2) + ' °C');
                     update(stateRef, { temperature: tempC });
-                    //    .then(() => console.log('Firebase update successful'))
-                    //    .catch(error => console.error('Error updating temperature to Firebase:', error.message));
                 });
 
                 console.log('Sending initial interval');
@@ -215,7 +209,6 @@ async function connectToDevice(adapter, destroy) {
                     txChar = null;
                 });
             }
-            // Allow event loop to process notifications
             await new Promise(resolve => setTimeout(resolve, 100));
         } catch (error) {
             console.error('Connection error:', error.message);
@@ -239,7 +232,7 @@ async function main() {
     console.log('Discovery started...');
 
     await connectToDevice(adapter, destroy);
-    await adapter.stopDiscovery(); // Stop discovery after connecting
+    await adapter.stopDiscovery();
 
     const stdin = process.openStdin();
     stdin.addListener('data', async function(d) {
@@ -260,8 +253,6 @@ async function main() {
             });
         }
     });
-
-    startIntervalListener();
 }
 
 main().then((ret) => {
