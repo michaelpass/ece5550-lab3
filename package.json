@@ -1,5 +1,9 @@
 {
   "dependencies": {
+    "@trbll/nodeimu": "^1.0.2",
+    "@trbll/sense-hat-led": "^1.0.2",
+    "dotenv": "^16.4.7",
+    "firebase": "^11.6.0",
     "node-ble": "^1.13.0"
   }
 }
